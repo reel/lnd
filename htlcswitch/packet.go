@@ -2,16 +2,13 @@ package htlcswitch
 
 import (
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
 
 // htlcPacket is a wrapper around htlc lnwire update, which adds additional
 // information which is needed by this package.
 type htlcPacket struct {
-	// destNode is the first-hop destination of a local created HTLC add
-	// message.
-	destNode [33]byte
-
 	// incomingChanID is the ID of the channel that we have received an incoming
 	// HTLC on.
 	incomingChanID lnwire.ShortChannelID
@@ -23,14 +20,6 @@ type htlcPacket struct {
 	// incomingHTLCID is the ID of the HTLC that we have received from the peer
 	// on the incoming channel.
 	incomingHTLCID uint64
-
-	// incomingHtlcAmt is the value of the *incoming* HTLC. This will be
-	// set by the link when it receives an incoming HTLC to be forwarded
-	// through the switch. Then the outgoing link will use this once it
-	// creates a full circuit add. This allows us to properly populate the
-	// forwarding event for this circuit/packet in the case the payment
-	// circuit is successful.
-	incomingHtlcAmt lnwire.MilliSatoshi
 
 	// outgoingHTLCID is the ID of the HTLC that we offered to the peer on the
 	// outgoing channel.
@@ -58,12 +47,25 @@ type htlcPacket struct {
 
 	// obfuscator contains the necessary state to allow the switch to wrap
 	// any forwarded errors in an additional layer of encryption.
-	obfuscator ErrorEncrypter
+	obfuscator hop.ErrorEncrypter
 
 	// localFailure is set to true if an HTLC fails for a local payment before
 	// the first hop. In this case, the failure reason is simply encoded, not
 	// encrypted with any shared secret.
 	localFailure bool
+
+	// linkFailure is non-nil for htlcs that fail at our node. This may
+	// occur for our own payments which fail on the outgoing link,
+	// or for forwards which fail in the switch or on the outgoing link.
+	linkFailure *LinkError
+
+	// convertedError is set to true if this is an HTLC fail that was
+	// created using an UpdateFailMalformedHTLC from the remote party. If
+	// this is true, then when forwarding this failure packet, we'll need
+	// to wrap it as if we were the first hop if it's a multi-hop HTLC. If
+	// it's a direct HTLC, then we'll decode the error as no encryption has
+	// taken place.
+	convertedError bool
 
 	// hasSource is set to true if the incomingChanID and incomingHTLCID
 	// fields of a forwarded fail packet are already set and do not need to
@@ -80,6 +82,15 @@ type htlcPacket struct {
 	// circuit holds a reference to an Add's circuit which is persisted in
 	// the switch during successful forwarding.
 	circuit *PaymentCircuit
+
+	// incomingTimeout is the timeout that the incoming HTLC carried. This
+	// is the timeout of the HTLC applied to the incoming link.
+	incomingTimeout uint32
+
+	// outgoingTimeout is the timeout of the proposed outgoing HTLC. This
+	// will be extraced from the hop payload recevived by the incoming
+	// link.
+	outgoingTimeout uint32
 }
 
 // inKey returns the circuit key used to identify the incoming htlc.

@@ -86,11 +86,12 @@ it won't be checked for validity.
 Since `lnd` requires macaroons by default in order to call RPC methods, `lncli`
 now reads a macaroon and provides it in the RPC call. Unless the path is
 changed by the `--macaroonpath` option, `lncli` tries to read the macaroon from
-`~/.lnd/admin.macaroon` by default and will error if that file doesn't exist
-unless provided the `--no-macaroons` option. Keep this in mind when running
-`lnd` with `--no-macaroons`, as `lncli` will error out unless called the same
-way **or** `lnd` has generated a macaroon on a previous run without this
-option.
+the network directory of `lnd`'s currently active network (e.g. for simnet
+`lnddir/data/chain/bitcoin/simnet/admin.macaroon`) by default and will error if
+that file doesn't exist unless provided the `--no-macaroons` option. Keep this
+in mind when running `lnd` with `--no-macaroons`, as `lncli` will error out
+unless called the same way **or** `lnd` has generated a macaroon on a previous
+run without this option.
 
 `lncli` also adds a caveat which makes it valid for only 60 seconds by default
 to help prevent replay in case the macaroon is somehow intercepted in
@@ -114,9 +115,14 @@ Where `<macaroon>` is the hex encoded binary data from the macaroon file itself.
 
 A very simple example using `curl` may look something like this:
 
-    curl --insecure --header "Grpc-Metadata-macaroon: $(xxd -ps -u -c 1000  $HOME/.lnd/admin.macaroon)" https://localhost:8080/v1/getinfo
+    curl --insecure --header "Grpc-Metadata-macaroon: $(xxd -ps -u -c 1000  $HOME/.lnd/data/chain/bitcoin/simnet/admin.macaroon)" https://localhost:8080/v1/getinfo
 
 Have a look at the [Java GRPC example](/docs/grpc/java.md) for programmatic usage details.
+
+## Creating macaroons with custom permissions
+
+The macaroon bakery is described in more detail in the
+[README in the macaroons package](../macaroons/README.md).
 
 ## Future improvements to the `lnd` macaroon implementation
 
@@ -129,8 +135,6 @@ such as:
 * Macaroon database encryption
 
 * Root key rotation and possibly macaroon invalidation/rotation
-
-* Tools to allow you to easily delegate macaroons in more flexible ways
 
 * Additional restrictions, such as limiting payments to use (or not use)
   specific routes, channels, nodes, etc.

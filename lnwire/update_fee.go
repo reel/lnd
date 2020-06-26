@@ -35,7 +35,7 @@ var _ Message = (*UpdateFee)(nil)
 //
 // This is part of the lnwire.Message interface.
 func (c *UpdateFee) Decode(r io.Reader, pver uint32) error {
-	return readElements(r,
+	return ReadElements(r,
 		&c.ChanID,
 		&c.FeePerKw,
 	)
@@ -46,7 +46,7 @@ func (c *UpdateFee) Decode(r io.Reader, pver uint32) error {
 //
 // This is part of the lnwire.Message interface.
 func (c *UpdateFee) Encode(w io.Writer, pver uint32) error {
-	return writeElements(w,
+	return WriteElements(w,
 		c.ChanID,
 		c.FeePerKw,
 	)
@@ -67,4 +67,12 @@ func (c *UpdateFee) MsgType() MessageType {
 func (c *UpdateFee) MaxPayloadLength(uint32) uint32 {
 	// 32 + 4
 	return 36
+}
+
+// TargetChanID returns the channel id of the link for which this message is
+// intended.
+//
+// NOTE: Part of lnd.LinkUpdater interface.
+func (c *UpdateFee) TargetChanID() ChannelID {
+	return c.ChanID
 }

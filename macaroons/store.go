@@ -1,15 +1,15 @@
 package macaroons
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"io"
+	"sync"
 
-	"golang.org/x/net/context"
+	"github.com/lightningnetwork/lnd/channeldb/kvdb"
 
-	"github.com/coreos/bbolt"
-
-	"github.com/roasbeef/btcwallet/snacl"
+	"github.com/btcsuite/btcwallet/snacl"
 )
 
 const (
@@ -46,17 +46,18 @@ var (
 
 // RootKeyStorage implements the bakery.RootKeyStorage interface.
 type RootKeyStorage struct {
-	*bolt.DB
+	kvdb.Backend
 
-	encKey *snacl.SecretKey
+	encKeyMtx sync.RWMutex
+	encKey    *snacl.SecretKey
 }
 
 // NewRootKeyStorage creates a RootKeyStorage instance.
 // TODO(aakselrod): Add support for encryption of data with passphrase.
-func NewRootKeyStorage(db *bolt.DB) (*RootKeyStorage, error) {
+func NewRootKeyStorage(db kvdb.Backend) (*RootKeyStorage, error) {
 	// If the store's bucket doesn't exist, create it.
-	err := db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(rootKeyBucketName)
+	err := kvdb.Update(db, func(tx kvdb.RwTx) error {
+		_, err := tx.CreateTopLevelBucket(rootKeyBucketName)
 		return err
 	})
 	if err != nil {
@@ -64,12 +65,15 @@ func NewRootKeyStorage(db *bolt.DB) (*RootKeyStorage, error) {
 	}
 
 	// Return the DB wrapped in a RootKeyStorage object.
-	return &RootKeyStorage{db, nil}, nil
+	return &RootKeyStorage{Backend: db, encKey: nil}, nil
 }
 
 // CreateUnlock sets an encryption key if one is not already set, otherwise it
 // checks if the password is correct for the stored encryption key.
 func (r *RootKeyStorage) CreateUnlock(password *[]byte) error {
+	r.encKeyMtx.Lock()
+	defer r.encKeyMtx.Unlock()
+
 	// Check if we've already unlocked the store; return an error if so.
 	if r.encKey != nil {
 		return ErrAlreadyUnlocked
@@ -80,8 +84,8 @@ func (r *RootKeyStorage) CreateUnlock(password *[]byte) error {
 		return ErrPasswordRequired
 	}
 
-	return r.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(rootKeyBucketName)
+	return kvdb.Update(r, func(tx kvdb.RwTx) error {
+		bucket := tx.ReadWriteBucket(rootKeyBucketName)
 		dbKey := bucket.Get(encryptedKeyID)
 		if len(dbKey) > 0 {
 			// We've already stored a key, so try to unlock with
@@ -102,8 +106,9 @@ func (r *RootKeyStorage) CreateUnlock(password *[]byte) error {
 		}
 
 		// We haven't yet stored a key, so create a new one.
-		encKey, err := snacl.NewSecretKey(password, snacl.DefaultN,
-			snacl.DefaultR, snacl.DefaultP)
+		encKey, err := snacl.NewSecretKey(
+			password, scryptN, scryptR, scryptP,
+		)
 		if err != nil {
 			return err
 		}
@@ -120,12 +125,15 @@ func (r *RootKeyStorage) CreateUnlock(password *[]byte) error {
 
 // Get implements the Get method for the bakery.RootKeyStorage interface.
 func (r *RootKeyStorage) Get(_ context.Context, id []byte) ([]byte, error) {
+	r.encKeyMtx.RLock()
+	defer r.encKeyMtx.RUnlock()
+
 	if r.encKey == nil {
 		return nil, ErrStoreLocked
 	}
 	var rootKey []byte
-	err := r.View(func(tx *bolt.Tx) error {
-		dbKey := tx.Bucket(rootKeyBucketName).Get(id)
+	err := kvdb.View(r, func(tx kvdb.RTx) error {
+		dbKey := tx.ReadBucket(rootKeyBucketName).Get(id)
 		if len(dbKey) == 0 {
 			return fmt.Errorf("root key with id %s doesn't exist",
 				string(id))
@@ -151,13 +159,16 @@ func (r *RootKeyStorage) Get(_ context.Context, id []byte) ([]byte, error) {
 // interface.
 // TODO(aakselrod): Add support for key rotation.
 func (r *RootKeyStorage) RootKey(_ context.Context) ([]byte, []byte, error) {
+	r.encKeyMtx.RLock()
+	defer r.encKeyMtx.RUnlock()
+
 	if r.encKey == nil {
 		return nil, nil, ErrStoreLocked
 	}
 	var rootKey []byte
 	id := defaultRootKeyID
-	err := r.Update(func(tx *bolt.Tx) error {
-		ns := tx.Bucket(rootKeyBucketName)
+	err := kvdb.Update(r, func(tx kvdb.RwTx) error {
+		ns := tx.ReadWriteBucket(rootKeyBucketName)
 		dbKey := ns.Get(id)
 
 		// If there's a root key stored in the bucket, decrypt it and
@@ -196,8 +207,11 @@ func (r *RootKeyStorage) RootKey(_ context.Context) ([]byte, []byte, error) {
 // Close closes the underlying database and zeroes the encryption key stored
 // in memory.
 func (r *RootKeyStorage) Close() error {
+	r.encKeyMtx.Lock()
+	defer r.encKeyMtx.Unlock()
+
 	if r.encKey != nil {
 		r.encKey.Zero()
 	}
-	return r.DB.Close()
+	return r.Backend.Close()
 }

@@ -1,6 +1,8 @@
 package lnwire
 
-import "io"
+import (
+	"io"
+)
 
 // UpdateFulfillHTLC is sent by Alice to Bob when she wishes to settle a
 // particular HTLC referenced by its HTLCKey within a specific active channel
@@ -41,7 +43,7 @@ var _ Message = (*UpdateFulfillHTLC)(nil)
 //
 // This is part of the lnwire.Message interface.
 func (c *UpdateFulfillHTLC) Decode(r io.Reader, pver uint32) error {
-	return readElements(r,
+	return ReadElements(r,
 		&c.ChanID,
 		&c.ID,
 		c.PaymentPreimage[:],
@@ -53,7 +55,7 @@ func (c *UpdateFulfillHTLC) Decode(r io.Reader, pver uint32) error {
 //
 // This is part of the lnwire.Message interface.
 func (c *UpdateFulfillHTLC) Encode(w io.Writer, pver uint32) error {
-	return writeElements(w,
+	return WriteElements(w,
 		c.ChanID,
 		c.ID,
 		c.PaymentPreimage[:],
@@ -75,4 +77,12 @@ func (c *UpdateFulfillHTLC) MsgType() MessageType {
 func (c *UpdateFulfillHTLC) MaxPayloadLength(uint32) uint32 {
 	// 32 + 8 + 32
 	return 72
+}
+
+// TargetChanID returns the channel id of the link for which this message is
+// intended.
+//
+// NOTE: Part of lnd.LinkUpdater interface.
+func (c *UpdateFulfillHTLC) TargetChanID() ChannelID {
+	return c.ChanID
 }

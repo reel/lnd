@@ -1,6 +1,6 @@
 ## Lightning Network Daemon
 
-[![Build Status](http://img.shields.io/travis/lightningnetwork/lnd.svg)](https://travis-ci.org/lightningnetwork/lnd)
+[![Build Status](https://img.shields.io/travis/lightningnetwork/lnd.svg)](https://travis-ci.org/lightningnetwork/lnd)
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/lightningnetwork/lnd/blob/master/LICENSE)
 [![Irc](https://img.shields.io/badge/chat-on%20freenode-brightgreen.svg)](https://webchat.freenode.net/?channels=lnd)
 [![Godoc](https://godoc.org/github.com/lightningnetwork/lnd?status.svg)](https://godoc.org/github.com/lightningnetwork/lnd)
@@ -8,8 +8,7 @@
 <img src="logo.png">
 
 The Lightning Network Daemon (`lnd`) - is a complete implementation of a
-[Lightning Network](https://lightning.network) node and currently deployed on
-`testnet3` - the Bitcoin Test Network.  `lnd` has several pluggable back-end
+[Lightning Network](https://lightning.network) node.  `lnd` has several pluggable back-end
 chain services including [`btcd`](https://github.com/btcsuite/btcd) (a
 full-node), [`bitcoind`](https://github.com/bitcoin/bitcoin), and
 [`neutrino`](https://github.com/lightninglabs/neutrino) (a new experimental light client). The project's codebase uses the
@@ -29,7 +28,7 @@ through the network.
 ## Lightning Network Specification Compliance
 `lnd` _fully_ conforms to the [Lightning Network specification
 (BOLTs)](https://github.com/lightningnetwork/lightning-rfc). BOLT stands for:
-Basic of Lightning Technologies. The specifications are currently being drafted
+Basis of Lightning Technology. The specifications are currently being drafted
 by several groups of implementers based around the world including the
 developers of `lnd`. The set of specification documents as well as our
 implementation of the specification are still a work-in-progress. With that
@@ -55,12 +54,12 @@ service. The exported API's are not yet stable, so be warned: they may change
 drastically in the near future.
 
 An automatically generated set of documentation for the RPC APIs can be found
-at [api.lightning.community](http://api.lightning.community). A set of developer
+at [api.lightning.community](https://api.lightning.community). A set of developer
 resources including talks, articles, and example applications can be found at:
-[dev.lightning.community](http://dev.lightning.community).
+[dev.lightning.community](https://dev.lightning.community).
 
 Finally, we also have an active
-[Slack](https://join.slack.com/t/lightningcommunity/shared_invite/enQtMzQ0OTQyNjE5NjU1LWRiMGNmOTZiNzU0MTVmYzc1ZGFkZTUyNzUwOGJjMjYwNWRkNWQzZWE3MTkwZjdjZGE5ZGNiNGVkMzI2MDU4ZTE) where protocol developers, application developers, testers and users gather to
+[Slack](https://lightning.engineering/slack.html) where protocol developers, application developers, testers and users gather to
 discuss various aspects of `lnd` and also Lightning in general.
 
 ## Installation
@@ -69,11 +68,29 @@ discuss various aspects of `lnd` and also Lightning in general.
 
 ## Docker
   To run lnd from Docker, please see the main [Docker instructions](docs/DOCKER.md)
-  
+
 ## IRC
   * irc.freenode.net
   * channel #lnd
   * [webchat](https://webchat.freenode.net/?channels=lnd)
+
+## Safety
+
+When operating a mainnet `lnd` node, please refer to our [operational safety
+guildelines](docs/safety.md). It is important to note that `lnd` is still
+**beta** software and that ignoring these operational guidelines can lead to
+loss of funds.
+
+## Security
+
+The developers of `lnd` take security _very_ seriously. The disclosure of
+security vulnerabilities helps us secure the health of `lnd`, privacy of our
+users, and also the health of the Lightning Network as a whole.  If you find
+any issues regarding security or privacy, please disclose the information
+responsibly by sending an email to security at lightning dot engineering,
+preferably [encrypted using our designated PGP key
+(`91FE464CD75101DA6B6BAB60555C6465E5BCB3AF`) which can be found
+[here](https://gist.githubusercontent.com/Roasbeef/6fb5b52886183239e4aa558f83d085d3/raw/5ef96c426e3cf20a2443dc9d3c7d6877576da9ca/security@lightning.engineering).
 
 ## Further reading
 * [Step-by-step send payment guide with docker](https://github.com/lightningnetwork/lnd/tree/master/docker)

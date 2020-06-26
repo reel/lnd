@@ -1,18 +1,18 @@
 package macaroons_test
 
 import (
-	"testing"
-	"path"
-	"os"
 	"context"
-	"io/ioutil"
 	"encoding/hex"
+	"io/ioutil"
+	"os"
+	"path"
+	"testing"
 
-	"github.com/coreos/bbolt"
+	"github.com/lightningnetwork/lnd/channeldb/kvdb"
 	"github.com/lightningnetwork/lnd/macaroons"
-	"gopkg.in/macaroon-bakery.v2/bakery/checkers"
-	"gopkg.in/macaroon-bakery.v2/bakery"
 	"google.golang.org/grpc/metadata"
+	"gopkg.in/macaroon-bakery.v2/bakery"
+	"gopkg.in/macaroon-bakery.v2/bakery/checkers"
 )
 
 var (
@@ -33,8 +33,9 @@ func setupTestRootKeyStorage(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("Error creating temp dir: %v", err)
 	}
-	db, err := bolt.Open(path.Join(tempDir, "macaroons.db"), 0600,
-		bolt.DefaultOptions)
+	db, err := kvdb.Create(
+		kvdb.BoltBackendName, path.Join(tempDir, "macaroons.db"), true,
+	)
 	if err != nil {
 		t.Fatalf("Error opening store DB: %v", err)
 	}
@@ -45,6 +46,9 @@ func setupTestRootKeyStorage(t *testing.T) string {
 	}
 	defer store.Close()
 	err = store.CreateUnlock(&defaultPw)
+	if err != nil {
+		t.Fatalf("error creating unlock: %v", err)
+	}
 	return tempDir
 }
 
@@ -58,18 +62,19 @@ func TestNewService(t *testing.T) {
 	// Second, create the new service instance, unlock it and pass in a
 	// checker that we expect it to add to the bakery.
 	service, err := macaroons.NewService(tempDir, macaroons.IPLockChecker)
-	defer service.Close()
 	if err != nil {
 		t.Fatalf("Error creating new service: %v", err)
 	}
+	defer service.Close()
 	err = service.CreateUnlock(&defaultPw)
 	if err != nil {
 		t.Fatalf("Error unlocking root key storage: %v", err)
 	}
 
 	// Third, check if the created service can bake macaroons.
-	macaroon, err := service.Oven.NewMacaroon(nil, bakery.LatestVersion,
-		nil, testOperation)
+	macaroon, err := service.Oven.NewMacaroon(
+		context.TODO(), bakery.LatestVersion, nil, testOperation,
+	)
 	if err != nil {
 		t.Fatalf("Error creating macaroon from service: %v", err)
 	}
@@ -101,18 +106,20 @@ func TestValidateMacaroon(t *testing.T) {
 	tempDir := setupTestRootKeyStorage(t)
 	defer os.RemoveAll(tempDir)
 	service, err := macaroons.NewService(tempDir, macaroons.IPLockChecker)
-	defer service.Close()
 	if err != nil {
 		t.Fatalf("Error creating new service: %v", err)
 	}
+	defer service.Close()
+
 	err = service.CreateUnlock(&defaultPw)
 	if err != nil {
 		t.Fatalf("Error unlocking root key storage: %v", err)
 	}
 
 	// Then, create a new macaroon that we can serialize.
-	macaroon, err := service.Oven.NewMacaroon(nil, bakery.LatestVersion,
-		nil, testOperation)
+	macaroon, err := service.Oven.NewMacaroon(
+		context.TODO(), bakery.LatestVersion, nil, testOperation,
+	)
 	if err != nil {
 		t.Fatalf("Error creating macaroon from service: %v", err)
 	}

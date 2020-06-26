@@ -50,8 +50,7 @@ if [[ "$CHAIN" == "litecoin" ]]; then
 fi
 
 exec lnd \
-    --noencryptwallet \
-    --logdir="/data" \
+    --noseedbackup \
     "--$CHAIN.active" \
     "--$CHAIN.$NETWORK" \
     "--$CHAIN.node"="btcd" \

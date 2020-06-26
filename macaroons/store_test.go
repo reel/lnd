@@ -2,16 +2,16 @@ package macaroons_test
 
 import (
 	"bytes"
+	"context"
 	"io/ioutil"
 	"os"
 	"path"
 	"testing"
 
-	"github.com/coreos/bbolt"
-
+	"github.com/lightningnetwork/lnd/channeldb/kvdb"
 	"github.com/lightningnetwork/lnd/macaroons"
 
-	"github.com/roasbeef/btcwallet/snacl"
+	"github.com/btcsuite/btcwallet/snacl"
 )
 
 func TestStore(t *testing.T) {
@@ -21,8 +21,9 @@ func TestStore(t *testing.T) {
 	}
 	defer os.RemoveAll(tempDir)
 
-	db, err := bolt.Open(path.Join(tempDir, "weks.db"), 0600,
-		bolt.DefaultOptions)
+	db, err := kvdb.Create(
+		kvdb.BoltBackendName, path.Join(tempDir, "weks.db"), true,
+	)
 	if err != nil {
 		t.Fatalf("Error opening store DB: %v", err)
 	}
@@ -34,12 +35,12 @@ func TestStore(t *testing.T) {
 	}
 	defer store.Close()
 
-	key, id, err := store.RootKey(nil)
+	_, _, err = store.RootKey(context.TODO())
 	if err != macaroons.ErrStoreLocked {
 		t.Fatalf("Received %v instead of ErrStoreLocked", err)
 	}
 
-	key, err = store.Get(nil, nil)
+	_, err = store.Get(context.TODO(), nil)
 	if err != macaroons.ErrStoreLocked {
 		t.Fatalf("Received %v instead of ErrStoreLocked", err)
 	}
@@ -50,13 +51,13 @@ func TestStore(t *testing.T) {
 		t.Fatalf("Error creating store encryption key: %v", err)
 	}
 
-	key, id, err = store.RootKey(nil)
+	key, id, err := store.RootKey(context.TODO())
 	if err != nil {
 		t.Fatalf("Error getting root key from store: %v", err)
 	}
 	rootID := id
 
-	key2, err := store.Get(nil, id)
+	key2, err := store.Get(context.TODO(), id)
 	if err != nil {
 		t.Fatalf("Error getting key with ID %s: %v", string(id), err)
 	}
@@ -72,11 +73,13 @@ func TestStore(t *testing.T) {
 	}
 
 	store.Close()
+
 	// Between here and the re-opening of the store, it's possible to get
 	// a double-close, but that's not such a big deal since the tests will
 	// fail anyway in that case.
-	db, err = bolt.Open(path.Join(tempDir, "weks.db"), 0600,
-		bolt.DefaultOptions)
+	db, err = kvdb.Create(
+		kvdb.BoltBackendName, path.Join(tempDir, "weks.db"), true,
+	)
 	if err != nil {
 		t.Fatalf("Error opening store DB: %v", err)
 	}
@@ -97,12 +100,12 @@ func TestStore(t *testing.T) {
 		t.Fatalf("Received %v instead of ErrPasswordRequired", err)
 	}
 
-	key, id, err = store.RootKey(nil)
+	_, _, err = store.RootKey(context.TODO())
 	if err != macaroons.ErrStoreLocked {
 		t.Fatalf("Received %v instead of ErrStoreLocked", err)
 	}
 
-	key, err = store.Get(nil, nil)
+	_, err = store.Get(context.TODO(), nil)
 	if err != macaroons.ErrStoreLocked {
 		t.Fatalf("Received %v instead of ErrStoreLocked", err)
 	}
@@ -112,7 +115,7 @@ func TestStore(t *testing.T) {
 		t.Fatalf("Error unlocking root key store: %v", err)
 	}
 
-	key, err = store.Get(nil, rootID)
+	key, err = store.Get(context.TODO(), rootID)
 	if err != nil {
 		t.Fatalf("Error getting key with ID %s: %v",
 			string(rootID), err)
@@ -122,7 +125,7 @@ func TestStore(t *testing.T) {
 			key2, key)
 	}
 
-	key, id, err = store.RootKey(nil)
+	key, id, err = store.RootKey(context.TODO())
 	if err != nil {
 		t.Fatalf("Error getting root key from store: %v", err)
 	}

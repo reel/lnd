@@ -2,8 +2,9 @@ package lnwire
 
 import (
 	"io"
+	"math"
 
-	"github.com/roasbeef/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 )
 
 // QueryChannelRange is a message sent by a node in order to query the
@@ -40,7 +41,7 @@ var _ Message = (*QueryChannelRange)(nil)
 //
 // This is part of the lnwire.Message interface.
 func (q *QueryChannelRange) Decode(r io.Reader, pver uint32) error {
-	return readElements(r,
+	return ReadElements(r,
 		q.ChainHash[:],
 		&q.FirstBlockHeight,
 		&q.NumBlocks,
@@ -52,7 +53,7 @@ func (q *QueryChannelRange) Decode(r io.Reader, pver uint32) error {
 //
 // This is part of the lnwire.Message interface.
 func (q *QueryChannelRange) Encode(w io.Writer, pver uint32) error {
-	return writeElements(w,
+	return WriteElements(w,
 		q.ChainHash[:],
 		q.FirstBlockHeight,
 		q.NumBlocks,
@@ -74,4 +75,15 @@ func (q *QueryChannelRange) MsgType() MessageType {
 func (q *QueryChannelRange) MaxPayloadLength(uint32) uint32 {
 	// 32 + 4 + 4
 	return 40
+}
+
+// LastBlockHeight returns the last block height covered by the range of a
+// QueryChannelRange message.
+func (q *QueryChannelRange) LastBlockHeight() uint32 {
+	// Handle overflows by casting to uint64.
+	lastBlockHeight := uint64(q.FirstBlockHeight) + uint64(q.NumBlocks) - 1
+	if lastBlockHeight > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(lastBlockHeight)
 }

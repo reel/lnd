@@ -24,16 +24,28 @@ _testmain.go
 *.test
 *.prof
 
-lnd
-lncli
+/lnd
+/lnd-debug
+/lncli
+/lncli-debug
+/lnd-itest
+/lncli-itest
 
-output*.log
+# Integration test log files
+lntest/itest/output*.log
+lntest/itest/pprof*.log
+lntest/itest/.backendlogs
+lntest/itest/.minerlogs
 
 cmd/cmd
 *.key
 *.hex
 
 cmd/lncli/lncli
+
+# Files from mobile build.
+mobile/build
+mobile/*_generated.go
 
 # vim
 *.swp
@@ -50,4 +62,7 @@ profile.tmp
 
 .DS_Store
 
-main*
+.vscode
+
+# Coverage test
+coverage.txt

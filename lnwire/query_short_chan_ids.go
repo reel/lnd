@@ -2,11 +2,13 @@ package lnwire
 
 import (
 	"bytes"
+	"compress/zlib"
 	"fmt"
 	"io"
 	"sort"
+	"sync"
 
-	"github.com/roasbeef/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 )
 
 // ShortChanIDEncoding is an enum-like type that represents exactly how a set
@@ -20,9 +22,36 @@ const (
 	// encoded using the regular encoding, in a sorted order.
 	EncodingSortedPlain ShortChanIDEncoding = 0
 
-	// TODO(roasbeef): list max number of short chan id's that are able to
-	// use
+	// EncodingSortedZlib signals that the set of short channel ID's is
+	// encoded by first sorting the set of channel ID's, as then
+	// compressing them using zlib.
+	EncodingSortedZlib ShortChanIDEncoding = 1
 )
+
+const (
+	// maxZlibBufSize is the max number of bytes that we'll accept from a
+	// zlib decoding instance. We do this in order to limit the total
+	// amount of memory allocated during a decoding instance.
+	maxZlibBufSize = 67413630
+)
+
+// ErrUnsortedSIDs is returned when decoding a QueryShortChannelID request whose
+// items were not sorted.
+type ErrUnsortedSIDs struct {
+	prevSID ShortChannelID
+	curSID  ShortChannelID
+}
+
+// Error returns a human-readable description of the error.
+func (e ErrUnsortedSIDs) Error() string {
+	return fmt.Sprintf("current sid: %v isn't greater than last sid: %v",
+		e.curSID, e.prevSID)
+}
+
+// zlibDecodeMtx is a package level mutex that we'll use in order to ensure
+// that we'll only attempt a single zlib decoding instance at a time. This
+// allows us to also further bound our memory usage.
+var zlibDecodeMtx sync.Mutex
 
 // ErrUnknownShortChanIDEncoding is a parametrized error that indicates that we
 // came across an unknown short channel ID encoding, and therefore were unable
@@ -51,6 +80,12 @@ type QueryShortChanIDs struct {
 
 	// ShortChanIDs is a slice of decoded short channel ID's.
 	ShortChanIDs []ShortChannelID
+
+	// noSort indicates whether or not to sort the short channel ids before
+	// writing them out.
+	//
+	// NOTE: This should only be used during testing.
+	noSort bool
 }
 
 // NewQueryShortChanIDs creates a new QueryShortChanIDs message.
@@ -73,7 +108,7 @@ var _ Message = (*QueryShortChanIDs)(nil)
 //
 // This is part of the lnwire.Message interface.
 func (q *QueryShortChanIDs) Decode(r io.Reader, pver uint32) error {
-	err := readElements(r, q.ChainHash[:])
+	err := ReadElements(r, q.ChainHash[:])
 	if err != nil {
 		return err
 	}
@@ -91,9 +126,13 @@ func decodeShortChanIDs(r io.Reader) (ShortChanIDEncoding, []ShortChannelID, err
 	// First, we'll attempt to read the number of bytes in the body of the
 	// set of encoded short channel ID's.
 	var numBytesResp uint16
-	err := readElements(r, &numBytesResp)
+	err := ReadElements(r, &numBytesResp)
 	if err != nil {
 		return 0, nil, err
+	}
+
+	if numBytesResp == 0 {
+		return 0, nil, nil
 	}
 
 	queryBody := make([]byte, numBytesResp)
@@ -130,19 +169,107 @@ func decodeShortChanIDs(r io.Reader) (ShortChanIDEncoding, []ShortChannelID, err
 		// compute the number of bytes encoded based on the size of the
 		// query body.
 		numShortChanIDs := len(queryBody) / 8
-		shortChanIDs := make([]ShortChannelID, numShortChanIDs)
+		if numShortChanIDs == 0 {
+			return encodingType, nil, nil
+		}
 
 		// Finally, we'll read out the exact number of short channel
 		// ID's to conclude our parsing.
+		shortChanIDs := make([]ShortChannelID, numShortChanIDs)
 		bodyReader := bytes.NewReader(queryBody)
+		var lastChanID ShortChannelID
 		for i := 0; i < numShortChanIDs; i++ {
-			if err := readElements(bodyReader, &shortChanIDs[i]); err != nil {
+			if err := ReadElements(bodyReader, &shortChanIDs[i]); err != nil {
 				return 0, nil, fmt.Errorf("unable to parse "+
 					"short chan ID: %v", err)
 			}
+
+			// We'll ensure that this short chan ID is greater than
+			// the last one. This is a requirement within the
+			// encoding, and if violated can aide us in detecting
+			// malicious payloads. This can only be true starting
+			// at the second chanID.
+			cid := shortChanIDs[i]
+			if i > 0 && cid.ToUint64() <= lastChanID.ToUint64() {
+				return 0, nil, ErrUnsortedSIDs{lastChanID, cid}
+			}
+			lastChanID = cid
 		}
 
 		return encodingType, shortChanIDs, nil
+
+	// In this encoding, we'll use zlib to decode the compressed payload.
+	// However, we'll pay attention to ensure that we don't open our selves
+	// up to a memory exhaustion attack.
+	case EncodingSortedZlib:
+		// We'll obtain an ultimately release the zlib decode mutex.
+		// This guards us against allocating too much memory to decode
+		// each instance from concurrent peers.
+		zlibDecodeMtx.Lock()
+		defer zlibDecodeMtx.Unlock()
+
+		// At this point, if there's no body remaining, then only the encoding
+		// type was specified, meaning that there're no further bytes to be
+		// parsed.
+		if len(queryBody) == 0 {
+			return encodingType, nil, nil
+		}
+
+		// Before we start to decode, we'll create a limit reader over
+		// the current reader. This will ensure that we can control how
+		// much memory we're allocating during the decoding process.
+		limitedDecompressor, err := zlib.NewReader(&io.LimitedReader{
+			R: bytes.NewReader(queryBody),
+			N: maxZlibBufSize,
+		})
+		if err != nil {
+			return 0, nil, fmt.Errorf("unable to create zlib reader: %v", err)
+		}
+
+		var (
+			shortChanIDs []ShortChannelID
+			lastChanID   ShortChannelID
+			i            int
+		)
+		for {
+			// We'll now attempt to read the next short channel ID
+			// encoded in the payload.
+			var cid ShortChannelID
+			err := ReadElements(limitedDecompressor, &cid)
+
+			switch {
+			// If we get an EOF error, then that either means we've
+			// read all that's contained in the buffer, or have hit
+			// our limit on the number of bytes we'll read. In
+			// either case, we'll return what we have so far.
+			case err == io.ErrUnexpectedEOF || err == io.EOF:
+				return encodingType, shortChanIDs, nil
+
+			// Otherwise, we hit some other sort of error, possibly
+			// an invalid payload, so we'll exit early with the
+			// error.
+			case err != nil:
+				return 0, nil, fmt.Errorf("unable to "+
+					"deflate next short chan "+
+					"ID: %v", err)
+			}
+
+			// We successfully read the next ID, so well collect
+			// that in the set of final ID's to return.
+			shortChanIDs = append(shortChanIDs, cid)
+
+			// Finally, we'll ensure that this short chan ID is
+			// greater than the last one. This is a requirement
+			// within the encoding, and if violated can aide us in
+			// detecting malicious payloads. This can only be true
+			// starting at the second chanID.
+			if i > 0 && cid.ToUint64() <= lastChanID.ToUint64() {
+				return 0, nil, ErrUnsortedSIDs{lastChanID, cid}
+			}
+
+			lastChanID = cid
+			i++
+		}
 
 	default:
 		// If we've been sent an encoding type that we don't know of,
@@ -158,20 +285,30 @@ func decodeShortChanIDs(r io.Reader) (ShortChanIDEncoding, []ShortChannelID, err
 // This is part of the lnwire.Message interface.
 func (q *QueryShortChanIDs) Encode(w io.Writer, pver uint32) error {
 	// First, we'll write out the chain hash.
-	err := writeElements(w, q.ChainHash[:])
+	err := WriteElements(w, q.ChainHash[:])
 	if err != nil {
 		return err
 	}
 
 	// Base on our encoding type, we'll write out the set of short channel
 	// ID's.
-	return encodeShortChanIDs(w, q.EncodingType, q.ShortChanIDs)
+	return encodeShortChanIDs(w, q.EncodingType, q.ShortChanIDs, q.noSort)
 }
 
 // encodeShortChanIDs encodes the passed short channel ID's into the passed
 // io.Writer, respecting the specified encoding type.
 func encodeShortChanIDs(w io.Writer, encodingType ShortChanIDEncoding,
-	shortChanIDs []ShortChannelID) error {
+	shortChanIDs []ShortChannelID, noSort bool) error {
+
+	// For both of the current encoding types, the channel ID's are to be
+	// sorted in place, so we'll do that now. The sorting is applied unless
+	// we were specifically requested not to for testing purposes.
+	if !noSort {
+		sort.Slice(shortChanIDs, func(i, j int) bool {
+			return shortChanIDs[i].ToUint64() <
+				shortChanIDs[j].ToUint64()
+		})
+	}
 
 	switch encodingType {
 
@@ -182,33 +319,90 @@ func encodeShortChanIDs(w io.Writer, encodingType ShortChanIDEncoding,
 		// body. We add 1 as the response will have the encoding type
 		// prepended to it.
 		numBytesBody := uint16(len(shortChanIDs)*8) + 1
-		if err := writeElements(w, numBytesBody); err != nil {
+		if err := WriteElements(w, numBytesBody); err != nil {
 			return err
 		}
 
 		// We'll then write out the encoding that that follows the
 		// actual encoded short channel ID's.
-		if err := writeElements(w, encodingType); err != nil {
+		if err := WriteElements(w, encodingType); err != nil {
 			return err
 		}
-
-		// Next, we'll ensure that the set of short channel ID's is
-		// properly sorted in place.
-		sort.Slice(shortChanIDs, func(i, j int) bool {
-			return shortChanIDs[i].ToUint64() <
-				shortChanIDs[j].ToUint64()
-		})
 
 		// Now that we know they're sorted, we can write out each short
 		// channel ID to the buffer.
 		for _, chanID := range shortChanIDs {
-			if err := writeElements(w, chanID); err != nil {
+			if err := WriteElements(w, chanID); err != nil {
 				return fmt.Errorf("unable to write short chan "+
 					"ID: %v", err)
 			}
 		}
 
 		return nil
+
+	// For this encoding we'll first write out a serialized version of all
+	// the channel ID's into a buffer, then zlib encode that. The final
+	// payload is what we'll write out to the passed io.Writer.
+	//
+	// TODO(roasbeef): assumes the caller knows the proper chunk size to
+	// pass to avoid bin-packing here
+	case EncodingSortedZlib:
+		// We'll make a new buffer, then wrap that with a zlib writer
+		// so we can write directly to the buffer and encode in a
+		// streaming manner.
+		var buf bytes.Buffer
+		zlibWriter := zlib.NewWriter(&buf)
+
+		// If we don't have anything at all to write, then we'll write
+		// an empty payload so we don't include things like the zlib
+		// header when the remote party is expecting no actual short
+		// channel IDs.
+		var compressedPayload []byte
+		if len(shortChanIDs) > 0 {
+			// Next, we'll write out all the channel ID's directly
+			// into the zlib writer, which will do compressing on
+			// the fly.
+			for _, chanID := range shortChanIDs {
+				err := WriteElements(zlibWriter, chanID)
+				if err != nil {
+					return fmt.Errorf("unable to write short chan "+
+						"ID: %v", err)
+				}
+			}
+
+			// Now that we've written all the elements, we'll
+			// ensure the compressed stream is written to the
+			// underlying buffer.
+			if err := zlibWriter.Close(); err != nil {
+				return fmt.Errorf("unable to finalize "+
+					"compression: %v", err)
+			}
+
+			compressedPayload = buf.Bytes()
+		}
+
+		// Now that we have all the items compressed, we can compute
+		// what the total payload size will be. We add one to account
+		// for the byte to encode the type.
+		//
+		// If we don't have any actual bytes to write, then we'll end
+		// up emitting one byte for the length, followed by the
+		// encoding type, and nothing more. The spec isn't 100% clear
+		// in this area, but we do this as this is what most of the
+		// other implementations do.
+		numBytesBody := len(compressedPayload) + 1
+
+		// Finally, we can write out the number of bytes, the
+		// compression type, and finally the buffer itself.
+		if err := WriteElements(w, uint16(numBytesBody)); err != nil {
+			return err
+		}
+		if err := WriteElements(w, encodingType); err != nil {
+			return err
+		}
+
+		_, err := w.Write(compressedPayload)
+		return err
 
 	default:
 		// If we're trying to encode with an encoding type that we

@@ -1,31 +1,34 @@
 // +build !rpctest
 
-package main
+package lnd
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
-	"github.com/btcsuite/btclog"
+	"github.com/btcsuite/btcd/txscript"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcutil"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/contractcourt"
 	"github.com/lightningnetwork/lnd/htlcswitch"
-	"github.com/lightningnetwork/lnd/lnrpc"
-	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
+	"github.com/lightningnetwork/lnd/lnwallet/chancloser"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
 )
 
-func init() {
-	peerLog = btclog.Disabled
-	srvrLog = btclog.Disabled
-	lnwallet.UseLogger(btclog.Disabled)
-	htlcswitch.UseLogger(btclog.Disabled)
-	channeldb.UseLogger(btclog.Disabled)
-	contractcourt.UseLogger(btclog.Disabled)
-}
+var (
+	// p2SHAddress is a valid pay to script hash address.
+	p2SHAddress = "2NBFNJTktNa7GZusGbDbGKRZTxdK9VVez3n"
+
+	// p2wshAddress is a valid pay to witness script hash address.
+	p2wshAddress = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"
+
+	// timeout is a timeout value to use for tests which need ot wait for
+	// a return value on a channel.
+	timeout = time.Second * 5
+)
 
 // TestPeerChannelClosureAcceptFeeResponder tests the shutdown responder's
 // behavior if we can agree on the fee immediately.
@@ -38,7 +41,8 @@ func TestPeerChannelClosureAcceptFeeResponder(t *testing.T) {
 	broadcastTxChan := make(chan *wire.MsgTx)
 
 	responder, responderChan, initiatorChan, cleanUp, err := createTestPeer(
-		notifier, broadcastTxChan)
+		notifier, broadcastTxChan, noUpdate,
+	)
 	if err != nil {
 		t.Fatalf("unable to create test channels: %v", err)
 	}
@@ -58,7 +62,7 @@ func TestPeerChannelClosureAcceptFeeResponder(t *testing.T) {
 	select {
 	case outMsg := <-responder.outgoingQueue:
 		msg = outMsg.msg
-	case <-time.After(time.Second * 5):
+	case <-time.After(timeout):
 		t.Fatalf("did not receive shutdown message")
 	}
 
@@ -74,7 +78,7 @@ func TestPeerChannelClosureAcceptFeeResponder(t *testing.T) {
 	select {
 	case outMsg := <-responder.outgoingQueue:
 		msg = outMsg.msg
-	case <-time.After(time.Second * 5):
+	case <-time.After(timeout):
 		t.Fatalf("did not receive ClosingSigned message")
 	}
 
@@ -93,7 +97,7 @@ func TestPeerChannelClosureAcceptFeeResponder(t *testing.T) {
 		t.Fatalf("error creating close proposal: %v", err)
 	}
 
-	parsedSig, err := lnwire.NewSigFromRawSignature(initiatorSig)
+	parsedSig, err := lnwire.NewSigFromSignature(initiatorSig)
 	if err != nil {
 		t.Fatalf("error parsing signature: %v", err)
 	}
@@ -107,7 +111,7 @@ func TestPeerChannelClosureAcceptFeeResponder(t *testing.T) {
 	// the closing transaction.
 	select {
 	case <-broadcastTxChan:
-	case <-time.After(time.Second * 5):
+	case <-time.After(timeout):
 		t.Fatalf("closing tx not broadcast")
 	}
 
@@ -126,14 +130,15 @@ func TestPeerChannelClosureAcceptFeeInitiator(t *testing.T) {
 	broadcastTxChan := make(chan *wire.MsgTx)
 
 	initiator, initiatorChan, responderChan, cleanUp, err := createTestPeer(
-		notifier, broadcastTxChan)
+		notifier, broadcastTxChan, noUpdate,
+	)
 	if err != nil {
 		t.Fatalf("unable to create test channels: %v", err)
 	}
 	defer cleanUp()
 
 	// We make the initiator send a shutdown request.
-	updateChan := make(chan *lnrpc.CloseStatusUpdate, 1)
+	updateChan := make(chan interface{}, 1)
 	errChan := make(chan error, 1)
 	closeCommand := &htlcswitch.ChanClose{
 		CloseType:      htlcswitch.CloseRegular,
@@ -149,7 +154,7 @@ func TestPeerChannelClosureAcceptFeeInitiator(t *testing.T) {
 	select {
 	case outMsg := <-initiator.outgoingQueue:
 		msg = outMsg.msg
-	case <-time.After(time.Second * 5):
+	case <-time.After(timeout):
 		t.Fatalf("did not receive shutdown request")
 	}
 
@@ -169,19 +174,18 @@ func TestPeerChannelClosureAcceptFeeInitiator(t *testing.T) {
 			dummyDeliveryScript),
 	}
 
-	estimator := lnwallet.StaticFeeEstimator{FeeRate: 50}
-	feeRate, err := estimator.EstimateFeePerVSize(1)
+	estimator := chainfee.NewStaticEstimator(12500, 0)
+	feePerKw, err := estimator.EstimateFeePerKW(1)
 	if err != nil {
 		t.Fatalf("unable to query fee estimator: %v", err)
 	}
-	feePerKw := feeRate.FeePerKWeight()
 	fee := responderChan.CalcFee(feePerKw)
 	closeSig, _, _, err := responderChan.CreateCloseProposal(fee,
 		dummyDeliveryScript, initiatorDeliveryScript)
 	if err != nil {
 		t.Fatalf("unable to create close proposal: %v", err)
 	}
-	parsedSig, err := lnwire.NewSigFromRawSignature(closeSig)
+	parsedSig, err := lnwire.NewSigFromSignature(closeSig)
 	if err != nil {
 		t.Fatalf("unable to parse signature: %v", err)
 	}
@@ -198,7 +202,7 @@ func TestPeerChannelClosureAcceptFeeInitiator(t *testing.T) {
 	select {
 	case outMsg := <-initiator.outgoingQueue:
 		msg = outMsg.msg
-	case <-time.After(time.Second * 5):
+	case <-time.After(timeout):
 		t.Fatalf("did not receive closing signed message")
 	}
 
@@ -216,7 +220,7 @@ func TestPeerChannelClosureAcceptFeeInitiator(t *testing.T) {
 	// the closing transaction.
 	select {
 	case <-broadcastTxChan:
-	case <-time.After(time.Second * 5):
+	case <-time.After(timeout):
 		t.Fatalf("closing tx not broadcast")
 	}
 
@@ -236,7 +240,7 @@ func TestPeerChannelClosureFeeNegotiationsResponder(t *testing.T) {
 	broadcastTxChan := make(chan *wire.MsgTx)
 
 	responder, responderChan, initiatorChan, cleanUp, err := createTestPeer(
-		notifier, broadcastTxChan,
+		notifier, broadcastTxChan, noUpdate,
 	)
 	if err != nil {
 		t.Fatalf("unable to create test channels: %v", err)
@@ -258,7 +262,7 @@ func TestPeerChannelClosureFeeNegotiationsResponder(t *testing.T) {
 	select {
 	case outMsg := <-responder.outgoingQueue:
 		msg = outMsg.msg
-	case <-time.After(time.Second * 5):
+	case <-time.After(timeout):
 		t.Fatalf("did not receive shutdown message")
 	}
 
@@ -274,7 +278,7 @@ func TestPeerChannelClosureFeeNegotiationsResponder(t *testing.T) {
 	select {
 	case outMsg := <-responder.outgoingQueue:
 		msg = outMsg.msg
-	case <-time.After(time.Second * 5):
+	case <-time.After(timeout):
 		t.Fatalf("did not receive closing signed message")
 	}
 
@@ -293,7 +297,7 @@ func TestPeerChannelClosureFeeNegotiationsResponder(t *testing.T) {
 		t.Fatalf("error creating close proposal: %v", err)
 	}
 
-	parsedSig, err := lnwire.NewSigFromRawSignature(initiatorSig)
+	parsedSig, err := lnwire.NewSigFromSignature(initiatorSig)
 	if err != nil {
 		t.Fatalf("error parsing signature: %v", err)
 	}
@@ -310,7 +314,7 @@ func TestPeerChannelClosureFeeNegotiationsResponder(t *testing.T) {
 	select {
 	case outMsg := <-responder.outgoingQueue:
 		msg = outMsg.msg
-	case <-time.After(time.Second * 5):
+	case <-time.After(timeout):
 		t.Fatalf("did not receive closing signed message")
 	}
 
@@ -337,7 +341,7 @@ func TestPeerChannelClosureFeeNegotiationsResponder(t *testing.T) {
 		t.Fatalf("error creating close proposal: %v", err)
 	}
 
-	parsedSig, err = lnwire.NewSigFromRawSignature(initiatorSig)
+	parsedSig, err = lnwire.NewSigFromSignature(initiatorSig)
 	if err != nil {
 		t.Fatalf("error parsing signature: %v", err)
 	}
@@ -352,7 +356,7 @@ func TestPeerChannelClosureFeeNegotiationsResponder(t *testing.T) {
 	select {
 	case outMsg := <-responder.outgoingQueue:
 		msg = outMsg.msg
-	case <-time.After(time.Second * 5):
+	case <-time.After(timeout):
 		t.Fatalf("did not receive closing signed message")
 	}
 
@@ -382,7 +386,7 @@ func TestPeerChannelClosureFeeNegotiationsResponder(t *testing.T) {
 		t.Fatalf("error creating close proposal: %v", err)
 	}
 
-	parsedSig, err = lnwire.NewSigFromRawSignature(initiatorSig)
+	parsedSig, err = lnwire.NewSigFromSignature(initiatorSig)
 	if err != nil {
 		t.Fatalf("error parsing signature: %v", err)
 	}
@@ -396,7 +400,7 @@ func TestPeerChannelClosureFeeNegotiationsResponder(t *testing.T) {
 	// the closing transaction.
 	select {
 	case <-broadcastTxChan:
-	case <-time.After(time.Second * 5):
+	case <-time.After(timeout):
 		t.Fatalf("closing tx not broadcast")
 	}
 
@@ -416,14 +420,15 @@ func TestPeerChannelClosureFeeNegotiationsInitiator(t *testing.T) {
 	broadcastTxChan := make(chan *wire.MsgTx)
 
 	initiator, initiatorChan, responderChan, cleanUp, err := createTestPeer(
-		notifier, broadcastTxChan)
+		notifier, broadcastTxChan, noUpdate,
+	)
 	if err != nil {
 		t.Fatalf("unable to create test channels: %v", err)
 	}
 	defer cleanUp()
 
 	// We make the initiator send a shutdown request.
-	updateChan := make(chan *lnrpc.CloseStatusUpdate, 1)
+	updateChan := make(chan interface{}, 1)
 	errChan := make(chan error, 1)
 	closeCommand := &htlcswitch.ChanClose{
 		CloseType:      htlcswitch.CloseRegular,
@@ -440,7 +445,7 @@ func TestPeerChannelClosureFeeNegotiationsInitiator(t *testing.T) {
 	select {
 	case outMsg := <-initiator.outgoingQueue:
 		msg = outMsg.msg
-	case <-time.After(time.Second * 5):
+	case <-time.After(timeout):
 		t.Fatalf("did not receive shutdown request")
 	}
 
@@ -460,14 +465,12 @@ func TestPeerChannelClosureFeeNegotiationsInitiator(t *testing.T) {
 		msg: respShutdown,
 	}
 
-	estimator := lnwallet.StaticFeeEstimator{FeeRate: 50}
-	initiatorIdealFeeRate, err := estimator.EstimateFeePerVSize(1)
+	estimator := chainfee.NewStaticEstimator(12500, 0)
+	initiatorIdealFeeRate, err := estimator.EstimateFeePerKW(1)
 	if err != nil {
 		t.Fatalf("unable to query fee estimator: %v", err)
 	}
-	initiatorIdealFee := responderChan.CalcFee(
-		initiatorIdealFeeRate.FeePerKWeight(),
-	)
+	initiatorIdealFee := responderChan.CalcFee(initiatorIdealFeeRate)
 	increasedFee := btcutil.Amount(float64(initiatorIdealFee) * 2.5)
 	closeSig, _, _, err := responderChan.CreateCloseProposal(
 		increasedFee, dummyDeliveryScript, initiatorDeliveryScript,
@@ -475,7 +478,7 @@ func TestPeerChannelClosureFeeNegotiationsInitiator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unable to create close proposal: %v", err)
 	}
-	parsedSig, err := lnwire.NewSigFromRawSignature(closeSig)
+	parsedSig, err := lnwire.NewSigFromSignature(closeSig)
 	if err != nil {
 		t.Fatalf("unable to parse signature: %v", err)
 	}
@@ -493,7 +496,7 @@ func TestPeerChannelClosureFeeNegotiationsInitiator(t *testing.T) {
 	select {
 	case outMsg := <-initiator.outgoingQueue:
 		msg = outMsg.msg
-	case <-time.After(time.Second * 5):
+	case <-time.After(timeout):
 		t.Fatalf("did not receive closing signed")
 	}
 	closingSignedMsg, ok := msg.(*lnwire.ClosingSigned)
@@ -511,7 +514,7 @@ func TestPeerChannelClosureFeeNegotiationsInitiator(t *testing.T) {
 	select {
 	case outMsg := <-initiator.outgoingQueue:
 		msg = outMsg.msg
-	case <-time.After(time.Second * 5):
+	case <-time.After(timeout):
 		t.Fatalf("did not receive closing signed")
 	}
 	closingSignedMsg, ok = msg.(*lnwire.ClosingSigned)
@@ -541,7 +544,7 @@ func TestPeerChannelClosureFeeNegotiationsInitiator(t *testing.T) {
 		t.Fatalf("error creating close proposal: %v", err)
 	}
 
-	parsedSig, err = lnwire.NewSigFromRawSignature(responderSig)
+	parsedSig, err = lnwire.NewSigFromSignature(responderSig)
 	if err != nil {
 		t.Fatalf("error parsing signature: %v", err)
 	}
@@ -557,7 +560,7 @@ func TestPeerChannelClosureFeeNegotiationsInitiator(t *testing.T) {
 	select {
 	case outMsg := <-initiator.outgoingQueue:
 		msg = outMsg.msg
-	case <-time.After(time.Second * 5):
+	case <-time.After(timeout):
 		t.Fatalf("did not receive closing signed")
 	}
 
@@ -587,7 +590,7 @@ func TestPeerChannelClosureFeeNegotiationsInitiator(t *testing.T) {
 		t.Fatalf("error creating close proposal: %v", err)
 	}
 
-	parsedSig, err = lnwire.NewSigFromRawSignature(responderSig)
+	parsedSig, err = lnwire.NewSigFromSignature(responderSig)
 	if err != nil {
 		t.Fatalf("error parsing signature: %v", err)
 	}
@@ -600,7 +603,233 @@ func TestPeerChannelClosureFeeNegotiationsInitiator(t *testing.T) {
 	// Wait for closing tx to be broadcasted.
 	select {
 	case <-broadcastTxChan:
-	case <-time.After(time.Second * 5):
+	case <-time.After(timeout):
 		t.Fatalf("closing tx not broadcast")
 	}
+}
+
+// TestChooseDeliveryScript tests that chooseDeliveryScript correctly errors
+// when upfront and user set scripts that do not match are provided, allows
+// matching values and returns appropriate values in the case where one or none
+// are set.
+func TestChooseDeliveryScript(t *testing.T) {
+	// generate non-zero scripts for testing.
+	script1 := genScript(t, p2SHAddress)
+	script2 := genScript(t, p2wshAddress)
+
+	tests := []struct {
+		name           string
+		userScript     lnwire.DeliveryAddress
+		shutdownScript lnwire.DeliveryAddress
+		expectedScript lnwire.DeliveryAddress
+		expectedError  error
+	}{
+		{
+			name:           "Neither set",
+			userScript:     nil,
+			shutdownScript: nil,
+			expectedScript: nil,
+			expectedError:  nil,
+		},
+		{
+			name:           "Both set and equal",
+			userScript:     script1,
+			shutdownScript: script1,
+			expectedScript: script1,
+			expectedError:  nil,
+		},
+		{
+			name:           "Both set and not equal",
+			userScript:     script1,
+			shutdownScript: script2,
+			expectedScript: nil,
+			expectedError:  chancloser.ErrUpfrontShutdownScriptMismatch,
+		},
+		{
+			name:           "Only upfront script",
+			userScript:     nil,
+			shutdownScript: script1,
+			expectedScript: script1,
+			expectedError:  nil,
+		},
+		{
+			name:           "Only user script",
+			userScript:     script2,
+			shutdownScript: nil,
+			expectedScript: script2,
+			expectedError:  nil,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+
+		t.Run(test.name, func(t *testing.T) {
+			script, err := chooseDeliveryScript(
+				test.shutdownScript, test.userScript,
+			)
+			if err != test.expectedError {
+				t.Fatalf("Expected: %v, got: %v", test.expectedError, err)
+			}
+
+			if !bytes.Equal(script, test.expectedScript) {
+				t.Fatalf("Expected: %x, got: %x", test.expectedScript, script)
+			}
+		})
+	}
+}
+
+// TestCustomShutdownScript tests that the delivery script of a shutdown
+// message can be set to a specified address. It checks that setting a close
+// script fails for channels which have an upfront shutdown script already set.
+func TestCustomShutdownScript(t *testing.T) {
+	script := genScript(t, p2SHAddress)
+
+	// setShutdown is a function which sets the upfront shutdown address for
+	// the local channel.
+	setShutdown := func(a, b *channeldb.OpenChannel) {
+		a.LocalShutdownScript = script
+		b.RemoteShutdownScript = script
+	}
+
+	tests := []struct {
+		name string
+
+		// update is a function used to set values on the channel set up for the
+		// test. It is used to set values for upfront shutdown addresses.
+		update func(a, b *channeldb.OpenChannel)
+
+		// userCloseScript is the address specified by the user.
+		userCloseScript lnwire.DeliveryAddress
+
+		// expectedScript is the address we expect to be set on the shutdown
+		// message.
+		expectedScript lnwire.DeliveryAddress
+
+		// expectedError is the error we expect, if any.
+		expectedError error
+	}{
+		{
+			name:            "User set script",
+			update:          noUpdate,
+			userCloseScript: script,
+			expectedScript:  script,
+		},
+		{
+			name:   "No user set script",
+			update: noUpdate,
+		},
+		{
+			name:           "Shutdown set, no user script",
+			update:         setShutdown,
+			expectedScript: script,
+		},
+		{
+			name:            "Shutdown set, user script matches",
+			update:          setShutdown,
+			userCloseScript: script,
+			expectedScript:  script,
+		},
+		{
+			name:            "Shutdown set, user script different",
+			update:          setShutdown,
+			userCloseScript: []byte("different addr"),
+			expectedError:   chancloser.ErrUpfrontShutdownScriptMismatch,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+
+		t.Run(test.name, func(t *testing.T) {
+			notifier := &mockNotfier{
+				confChannel: make(chan *chainntnfs.TxConfirmation),
+			}
+			broadcastTxChan := make(chan *wire.MsgTx)
+
+			// Open a channel.
+			initiator, initiatorChan, _, cleanUp, err := createTestPeer(
+				notifier, broadcastTxChan, test.update,
+			)
+			if err != nil {
+				t.Fatalf("unable to create test channels: %v", err)
+			}
+			defer cleanUp()
+
+			// Request initiator to cooperatively close the channel, with
+			// a specified delivery address.
+			updateChan := make(chan interface{}, 1)
+			errChan := make(chan error, 1)
+			chanPoint := initiatorChan.ChannelPoint()
+			closeCommand := htlcswitch.ChanClose{
+				CloseType:      htlcswitch.CloseRegular,
+				ChanPoint:      chanPoint,
+				Updates:        updateChan,
+				TargetFeePerKw: 12500,
+				DeliveryScript: test.userCloseScript,
+				Err:            errChan,
+			}
+
+			// Send the close command for the correct channel and check that a
+			// shutdown message is sent.
+			initiator.localCloseChanReqs <- &closeCommand
+
+			var msg lnwire.Message
+			select {
+			case outMsg := <-initiator.outgoingQueue:
+				msg = outMsg.msg
+			case <-time.After(timeout):
+				t.Fatalf("did not receive shutdown message")
+			case err := <-errChan:
+				// Fail if we do not expect an error.
+				if err != test.expectedError {
+					t.Fatalf("error closing channel: %v", err)
+				}
+
+				// Terminate the test early if have received an error, no
+				// further action is expected.
+				return
+			}
+
+			// Check that we have received a shutdown message.
+			shutdownMsg, ok := msg.(*lnwire.Shutdown)
+			if !ok {
+				t.Fatalf("expected shutdown message, got %T", msg)
+			}
+
+			// If the test has not specified an expected address, do not check
+			// whether the shutdown address matches. This covers the case where
+			// we epect shutdown to a random address and cannot match it.
+			if len(test.expectedScript) == 0 {
+				return
+			}
+
+			// Check that the Shutdown message includes the expected delivery
+			// script.
+			if !bytes.Equal(test.expectedScript, shutdownMsg.Address) {
+				t.Fatalf("expected delivery script: %x, got: %x",
+					test.expectedScript, shutdownMsg.Address)
+			}
+		})
+	}
+}
+
+// genScript creates a script paying out to the address provided, which must
+// be a valid address.
+func genScript(t *testing.T, address string) lnwire.DeliveryAddress {
+	// Generate an address which can be used for testing.
+	deliveryAddr, err := btcutil.DecodeAddress(
+		address,
+		activeNetParams.Params,
+	)
+	if err != nil {
+		t.Fatalf("invalid delivery address: %v", err)
+	}
+
+	script, err := txscript.PayToAddrScript(deliveryAddr)
+	if err != nil {
+		t.Fatalf("cannot create script: %v", err)
+	}
+
+	return script
 }

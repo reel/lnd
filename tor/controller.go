@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/textproto"
-	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 )
@@ -30,6 +30,21 @@ const (
 	// ProtocolInfoVersion is the `protocolinfo` version currently supported
 	// by the Tor server.
 	ProtocolInfoVersion = 1
+
+	// MinTorVersion is the minimum supported version that the Tor server
+	// must be running on. This is needed in order to create v3 onion
+	// services through Tor's control port.
+	MinTorVersion = "0.3.3.6"
+
+	// authSafeCookie is the name of the SAFECOOKIE authentication method.
+	authSafeCookie = "SAFECOOKIE"
+
+	// authHashedPassword is the name of the HASHEDPASSWORD authentication
+	// method.
+	authHashedPassword = "HASHEDPASSWORD"
+
+	// authNull is the name of the NULL authentication method.
+	authNull = "NULL"
 )
 
 var (
@@ -72,12 +87,31 @@ type Controller struct {
 	// controlAddr is the host:port the Tor server is listening locally for
 	// controller connections on.
 	controlAddr string
+
+	// password, if non-empty, signals that the controller should attempt to
+	// authenticate itself with the backing Tor daemon through the
+	// HASHEDPASSWORD authentication method with this value.
+	password string
+
+	// version is the current version of the Tor server.
+	version string
+
+	// targetIPAddress is the IP address which we tell the Tor server to use
+	// to connect to the LND node.  This is required when the Tor server
+	// runs on another host, otherwise the service will not be reachable.
+	targetIPAddress string
 }
 
 // NewController returns a new Tor controller that will be able to interact with
 // a Tor server.
-func NewController(controlAddr string) *Controller {
-	return &Controller{controlAddr: controlAddr}
+func NewController(controlAddr string, targetIPAddress string,
+	password string) *Controller {
+
+	return &Controller{
+		controlAddr:     controlAddr,
+		targetIPAddress: targetIPAddress,
+		password:        password,
+	}
 }
 
 // Start establishes and authenticates the connection between the controller and
@@ -124,8 +158,8 @@ func (c *Controller) sendCommand(command string) (int, string, error) {
 	return code, reply, nil
 }
 
-// parseTorReply parses the reply from the Tor server after receving a command
-// from a controller. This will parse the relevent reply parameters into a map
+// parseTorReply parses the reply from the Tor server after receiving a command
+// from a controller. This will parse the relevant reply parameters into a map
 // of keys and values.
 func parseTorReply(reply string) map[string]string {
 	params := make(map[string]string)
@@ -140,7 +174,7 @@ func parseTorReply(reply string) map[string]string {
 		// "KEY=VALUE". If the parameter doesn't contain "=", then we
 		// can assume it does not provide any other relevant information
 		// already known.
-		keyValue := strings.Split(content, "=")
+		keyValue := strings.SplitN(content, "=", 2)
 		if len(keyValue) != 2 {
 			continue
 		}
@@ -154,14 +188,69 @@ func parseTorReply(reply string) map[string]string {
 }
 
 // authenticate authenticates the connection between the controller and the
-// Tor server using the SAFECOOKIE authentication method.
+// Tor server using either of the following supported authentication methods
+// depending on its configuration: SAFECOOKIE, HASHEDPASSWORD, and NULL.
 func (c *Controller) authenticate() error {
+	protocolInfo, err := c.protocolInfo()
+	if err != nil {
+		return err
+	}
+
+	// With the version retrieved, we'll cache it now in case it needs to be
+	// used later on.
+	c.version = protocolInfo.version()
+
+	switch {
+	// If a password was provided, then we should attempt to use the
+	// HASHEDPASSWORD authentication method.
+	case c.password != "":
+		if !protocolInfo.supportsAuthMethod(authHashedPassword) {
+			return fmt.Errorf("%v authentication method not "+
+				"supported", authHashedPassword)
+		}
+
+		return c.authenticateViaHashedPassword()
+
+	// Otherwise, attempt to authentication via the SAFECOOKIE method as it
+	// provides the most security.
+	case protocolInfo.supportsAuthMethod(authSafeCookie):
+		return c.authenticateViaSafeCookie(protocolInfo)
+
+	// Fallback to the NULL method if any others aren't supported.
+	case protocolInfo.supportsAuthMethod(authNull):
+		return c.authenticateViaNull()
+
+	// No supported authentication methods, fail.
+	default:
+		return errors.New("the Tor server must be configured with " +
+			"NULL, SAFECOOKIE, or HASHEDPASSWORD authentication")
+	}
+}
+
+// authenticateViaNull authenticates the controller with the Tor server using
+// the NULL authentication method.
+func (c *Controller) authenticateViaNull() error {
+	_, _, err := c.sendCommand("AUTHENTICATE")
+	return err
+}
+
+// authenticateViaHashedPassword authenticates the controller with the Tor
+// server using the HASHEDPASSWORD authentication method.
+func (c *Controller) authenticateViaHashedPassword() error {
+	cmd := fmt.Sprintf("AUTHENTICATE \"%s\"", c.password)
+	_, _, err := c.sendCommand(cmd)
+	return err
+}
+
+// authenticateViaSafeCookie authenticates the controller with the Tor server
+// using the SAFECOOKIE authentication method.
+func (c *Controller) authenticateViaSafeCookie(info protocolInfo) error {
 	// Before proceeding to authenticate the connection, we'll retrieve
 	// the authentication cookie of the Tor server. This will be used
 	// throughout the authentication routine. We do this before as once the
 	// authentication routine has begun, it is not possible to retrieve it
 	// mid-way.
-	cookie, err := c.getAuthCookie()
+	cookie, err := c.getAuthCookie(info)
 	if err != nil {
 		return fmt.Errorf("unable to retrieve authentication cookie: "+
 			"%v", err)
@@ -252,27 +341,14 @@ func (c *Controller) authenticate() error {
 
 // getAuthCookie retrieves the authentication cookie in bytes from the Tor
 // server. Cookie authentication must be enabled for this to work.
-func (c *Controller) getAuthCookie() ([]byte, error) {
-	// Retrieve the authentication methods currently supported by the Tor
-	// server.
-	authMethods, cookieFilePath, _, err := c.ProtocolInfo()
-	if err != nil {
-		return nil, err
+func (c *Controller) getAuthCookie(info protocolInfo) ([]byte, error) {
+	// Retrieve the cookie file path from the PROTOCOLINFO reply.
+	cookieFilePath, ok := info["COOKIEFILE"]
+	if !ok {
+		return nil, errors.New("COOKIEFILE not found in PROTOCOLINFO " +
+			"reply")
 	}
-
-	// Ensure that the Tor server supports the SAFECOOKIE authentication
-	// method.
-	safeCookieSupport := false
-	for _, authMethod := range authMethods {
-		if authMethod == "SAFECOOKIE" {
-			safeCookieSupport = true
-		}
-	}
-
-	if !safeCookieSupport {
-		return nil, errors.New("the Tor server is currently not " +
-			"configured for cookie authentication")
-	}
+	cookieFilePath = strings.Trim(cookieFilePath, "\"")
 
 	// Read the cookie from the file and ensure it has the correct length.
 	cookie, err := ioutil.ReadFile(cookieFilePath)
@@ -294,155 +370,71 @@ func computeHMAC256(key, message []byte) []byte {
 	return mac.Sum(nil)
 }
 
-// ProtocolInfo returns the different authentication methods supported by the
-// Tor server and the version of the Tor server.
-func (c *Controller) ProtocolInfo() ([]string, string, string, error) {
-	// We'll start off by sending the "PROTOCOLINFO" command to the Tor
-	// server. We should receive a reply of the following format:
-	//
-	//	METHODS=COOKIE,SAFECOOKIE
-	//	COOKIEFILE="/home/user/.tor/control_auth_cookie"
-	//	VERSION Tor="0.3.2.10"
-	//
-	// We're interested in retrieving all of these fields, so we'll parse
-	// our reply to do so.
-	cmd := fmt.Sprintf("PROTOCOLINFO %d", ProtocolInfoVersion)
-	_, reply, err := c.sendCommand(cmd)
-	if err != nil {
-		return nil, "", "", err
+// supportsV3 is a helper function that parses the current version of the Tor
+// server and determines whether it supports creationg v3 onion services through
+// Tor's control port. The version string should be of the format:
+//	major.minor.revision.build
+func supportsV3(version string) error {
+	// We'll split the minimum Tor version that's supported and the given
+	// version in order to individually compare each number.
+	parts := strings.Split(version, ".")
+	if len(parts) != 4 {
+		return errors.New("version string is not of the format " +
+			"major.minor.revision.build")
 	}
 
-	info := parseTorReply(reply)
-	methods, ok := info["METHODS"]
-	if !ok {
-		return nil, "", "", errors.New("auth methods not found in " +
-			"reply")
+	// It's possible that the build number (the last part of the version
+	// string) includes a pre-release string, e.g. rc, beta, etc., so we'll
+	// parse that as well.
+	build := strings.Split(parts[len(parts)-1], "-")
+	parts[len(parts)-1] = build[0]
+
+	// Ensure that each part of the version string corresponds to a number.
+	for _, part := range parts {
+		if _, err := strconv.Atoi(part); err != nil {
+			return err
+		}
 	}
 
-	cookieFile, ok := info["COOKIEFILE"]
-	if !ok {
-		return nil, "", "", errors.New("cookie file path not found " +
-			"in reply")
+	// Once we've determined we have a proper version string of the format
+	// major.minor.revision.build, we can just do a string comparison to
+	// determine if it satisfies the minimum version supported.
+	if version < MinTorVersion {
+		return fmt.Errorf("version %v below minimum version supported "+
+			"%v", version, MinTorVersion)
 	}
 
-	version, ok := info["Tor"]
-	if !ok {
-		return nil, "", "", errors.New("Tor version not found in reply")
-	}
-
-	// Finally, we'll clean up the results before returning them.
-	authMethods := strings.Split(methods, ",")
-	cookieFilePath := strings.Trim(cookieFile, "\"")
-	torVersion := strings.Trim(version, "\"")
-
-	return authMethods, cookieFilePath, torVersion, nil
+	return nil
 }
 
-// VirtToTargPorts is a mapping of virtual ports to target ports. When creating
-// an onion service, it will be listening externally on each virtual port. Each
-// virtual port can then be mapped to one or many target ports internally. When
-// accessing the onion service at a specific virtual port, it will forward the
-// traffic to a mapped randomly chosen target port.
-type VirtToTargPorts = map[int]map[int]struct{}
+// protocolInfo is encompasses the details of a response to a PROTOCOLINFO
+// command.
+type protocolInfo map[string]string
 
-// AddOnionV2 creates a new v2 onion service and returns its onion address(es).
-// Once created, the new onion service will remain active until the connection
-// between the controller and the Tor server is closed. The path to a private
-// key can be provided in order to restore a previously created onion service.
-// If a file at this path does not exist, a new onion service will be created
-// and its private key will be saved to a file at this path. A mapping of
-// virtual ports to target ports should also be provided. Each virtual port will
-// be the ports where the onion service can be reached at, while the mapped
-// target ports will be the ports where the onion service is running locally.
-func (c *Controller) AddOnionV2(privateKeyFilename string,
-	virtToTargPorts VirtToTargPorts) ([]*OnionAddr, error) {
+// version returns the Tor version as reported by the server.
+func (i protocolInfo) version() string {
+	version := i["Tor"]
+	return strings.Trim(version, "\"")
+}
 
-	// We'll start off by checking if the file containing the private key
-	// exists. If it does not, then we should request the server to create
-	// a new onion service and return its private key. Otherwise, we'll
-	// request the server to recreate the onion server from our private key.
-	var keyParam string
-	if _, err := os.Stat(privateKeyFilename); os.IsNotExist(err) {
-		keyParam = "NEW:RSA1024"
-	} else {
-		privateKey, err := ioutil.ReadFile(privateKeyFilename)
-		if err != nil {
-			return nil, err
-		}
-		keyParam = string(privateKey)
+// supportsAuthMethod determines whether the Tor server supports the given
+// authentication method.
+func (i protocolInfo) supportsAuthMethod(method string) bool {
+	methods, ok := i["METHODS"]
+	if !ok {
+		return false
 	}
+	return strings.Contains(methods, method)
+}
 
-	// Now, we'll determine the different virtual ports on which this onion
-	// service will be accessed by.
-	var portParam string
-	for virtPort, targPorts := range virtToTargPorts {
-		// If the virtual port doesn't map to any target ports, we'll
-		// use the virtual port as the target port.
-		if len(targPorts) == 0 {
-			portParam += fmt.Sprintf("Port=%d,%d ", virtPort,
-				virtPort)
-			continue
-		}
-
-		// Otherwise, we'll create a mapping from the virtual port to
-		// each target port.
-		for targPort := range targPorts {
-			portParam += fmt.Sprintf("Port=%d,%d ", virtPort,
-				targPort)
-		}
-	}
-
-	cmd := fmt.Sprintf("ADD_ONION %s %s", keyParam, portParam)
+// protocolInfo sends a "PROTOCOLINFO" command to the Tor server and returns its
+// response.
+func (c *Controller) protocolInfo() (protocolInfo, error) {
+	cmd := fmt.Sprintf("PROTOCOLINFO %d", ProtocolInfoVersion)
 	_, reply, err := c.sendCommand(cmd)
 	if err != nil {
 		return nil, err
 	}
 
-	// If successful, the reply from the server should be of the following
-	// format, depending on whether a private key has been requested:
-	//
-	//	C: ADD_ONION RSA1024:[Blob Redacted] Port=80,8080
-	//	S: 250-ServiceID=testonion1234567
-	//	S: 250 OK
-	//
-	//	C: ADD_ONION NEW:RSA1024 Port=80,8080
-	//	S: 250-ServiceID=testonion1234567
-	//	S: 250-PrivateKey=RSA1024:[Blob Redacted]
-	//	S: 250 OK
-	//
-	// We're interested in retrieving the service ID, which is the public
-	// name of the service, and the private key if requested.
-	replyParams := parseTorReply(reply)
-	serviceID, ok := replyParams["ServiceID"]
-	if !ok {
-		return nil, errors.New("service id not found in reply")
-	}
-
-	// If a new onion service was created, we'll write its private key to
-	// disk under strict permissions in the event that it needs to be
-	// recreated later on.
-	if privateKey, ok := replyParams["PrivateKey"]; ok {
-		err := ioutil.WriteFile(
-			privateKeyFilename, []byte(privateKey), 0600,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("unable to write private key "+
-				"to file: %v", err)
-		}
-	}
-
-	// Finally, return the different onion addresses composed of the service
-	// ID, along with the onion suffix, and the different virtual ports this
-	// onion service can be reached at.
-	onionService := serviceID + ".onion"
-	addrs := make([]*OnionAddr, 0, len(virtToTargPorts))
-	for virtPort := range virtToTargPorts {
-		addr := &OnionAddr{
-			OnionService: onionService,
-			Port:         virtPort,
-		}
-		addrs = append(addrs, addr)
-	}
-
-	return addrs, nil
+	return protocolInfo(parseTorReply(reply)), nil
 }

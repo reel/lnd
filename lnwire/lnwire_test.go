@@ -14,22 +14,15 @@ import (
 	"testing/quick"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcutil"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/tor"
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/chaincfg/chainhash"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
 )
 
 var (
-	revHash = [32]byte{
-		0xb7, 0x94, 0x38, 0x5f, 0x2d, 0x1e, 0xf7, 0xab,
-		0x4d, 0x92, 0x73, 0xd1, 0x90, 0x63, 0x81, 0xb4,
-		0x4f, 0x2f, 0x6f, 0x25, 0x88, 0xa3, 0xef, 0xb9,
-		0x6a, 0x49, 0x18, 0x83, 0x31, 0x98, 0x47, 0x53,
-	}
-
 	shaHash1Bytes, _ = hex.DecodeString("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
 	shaHash1, _      = chainhash.NewHash(shaHash1Bytes)
 	outpoint1        = wire.NewOutPoint(shaHash1, 0)
@@ -40,6 +33,17 @@ var (
 	_, _ = testSig.R.SetString("63724406601629180062774974542967536251589935445068131219452686511677818569431", 10)
 	_, _ = testSig.S.SetString("18801056069249825825291287104931333862866033135609736119018462340006816851118", 10)
 )
+
+const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+func randAlias(r *rand.Rand) NodeAlias {
+	var a NodeAlias
+	for i := range a {
+		a[i] = letterBytes[r.Intn(len(letterBytes))]
+	}
+
+	return a
+}
 
 func randPubKey() (*btcec.PublicKey, error) {
 	priv, err := btcec.NewPrivateKey(btcec.S256())
@@ -61,6 +65,15 @@ func randRawKey() ([33]byte, error) {
 	copy(n[:], priv.PubKey().SerializeCompressed())
 
 	return n, nil
+}
+
+func randDeliveryAddress(r *rand.Rand) (DeliveryAddress, error) {
+	// Generate size minimum one. Empty scripts should be tested specifically.
+	size := r.Intn(deliveryAddressMaxSize) + 1
+	da := DeliveryAddress(make([]byte, size))
+
+	_, err := r.Read(da)
+	return da, err
 }
 
 func randRawFeatureVector(r *rand.Rand) *RawFeatureVector {
@@ -167,6 +180,50 @@ func randAddrs(r *rand.Rand) ([]net.Addr, error) {
 	return []net.Addr{tcp4Addr, tcp6Addr, v2OnionAddr, v3OnionAddr}, nil
 }
 
+// TestChanUpdateChanFlags ensures that converting the ChanUpdateChanFlags and
+// ChanUpdateMsgFlags bitfields to a string behaves as expected.
+func TestChanUpdateChanFlags(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		flags    uint8
+		expected string
+	}{
+		{
+			flags:    0,
+			expected: "00000000",
+		},
+		{
+			flags:    1,
+			expected: "00000001",
+		},
+		{
+			flags:    3,
+			expected: "00000011",
+		},
+		{
+			flags:    255,
+			expected: "11111111",
+		},
+	}
+
+	for _, test := range testCases {
+		chanFlag := ChanUpdateChanFlags(test.flags)
+		toStr := chanFlag.String()
+		if toStr != test.expected {
+			t.Fatalf("expected %v, got %v",
+				test.expected, toStr)
+		}
+
+		msgFlag := ChanUpdateMsgFlags(test.flags)
+		toStr = msgFlag.String()
+		if toStr != test.expected {
+			t.Fatalf("expected %v, got %v",
+				test.expected, toStr)
+		}
+	}
+}
+
 func TestMaxOutPointIndex(t *testing.T) {
 	t.Parallel()
 
@@ -175,7 +232,7 @@ func TestMaxOutPointIndex(t *testing.T) {
 	}
 
 	var b bytes.Buffer
-	if err := writeElement(&b, op); err == nil {
+	if err := WriteElement(&b, op); err == nil {
 		t.Fatalf("write of outPoint should fail, index exceeds 16-bits")
 	}
 }
@@ -193,6 +250,9 @@ func TestEmptyMessageUnknownType(t *testing.T) {
 // TestLightningWireProtocol uses the testing/quick package to create a series
 // of fuzz tests to attempt to break a primary scenario which is implemented as
 // property based testing scenario.
+//
+// Debug help: when the message payload can reach a size larger than the return
+// value of MaxPayloadLength, the test can panic without a helpful message.
 func TestLightningWireProtocol(t *testing.T) {
 	t.Parallel()
 
@@ -305,6 +365,17 @@ func TestLightningWireProtocol(t *testing.T) {
 				return
 			}
 
+			// 1/2 chance empty upfront shutdown script.
+			if r.Intn(2) == 0 {
+				req.UpfrontShutdownScript, err = randDeliveryAddress(r)
+				if err != nil {
+					t.Fatalf("unable to generate delivery address: %v", err)
+					return
+				}
+			} else {
+				req.UpfrontShutdownScript = []byte{}
+			}
+
 			v[0] = reflect.ValueOf(req)
 		},
 		MsgAcceptChannel: func(v []reflect.Value, r *rand.Rand) {
@@ -353,6 +424,17 @@ func TestLightningWireProtocol(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unable to generate key: %v", err)
 				return
+			}
+
+			// 1/2 chance empty upfront shutdown script.
+			if r.Intn(2) == 0 {
+				req.UpfrontShutdownScript, err = randDeliveryAddress(r)
+				if err != nil {
+					t.Fatalf("unable to generate delivery address: %v", err)
+					return
+				}
+			} else {
+				req.UpfrontShutdownScript = []byte{}
 			}
 
 			v[0] = reflect.ValueOf(req)
@@ -537,20 +619,25 @@ func TestLightningWireProtocol(t *testing.T) {
 				return
 			}
 
+			numExtraBytes := r.Int31n(1000)
+			if numExtraBytes > 0 {
+				req.ExtraOpaqueData = make([]byte, numExtraBytes)
+				_, err := r.Read(req.ExtraOpaqueData[:])
+				if err != nil {
+					t.Fatalf("unable to generate opaque "+
+						"bytes: %v", err)
+					return
+				}
+			}
+
 			v[0] = reflect.ValueOf(req)
 		},
 		MsgNodeAnnouncement: func(v []reflect.Value, r *rand.Rand) {
-			var a [32]byte
-			if _, err := r.Read(a[:]); err != nil {
-				t.Fatalf("unable to generate alias: %v", err)
-				return
-			}
-
 			var err error
 			req := NodeAnnouncement{
 				Features:  randRawFeatureVector(r),
 				Timestamp: uint32(r.Int31()),
-				Alias:     a,
+				Alias:     randAlias(r),
 				RGBColor: color.RGBA{
 					R: uint8(r.Int31()),
 					G: uint8(r.Int31()),
@@ -574,16 +661,41 @@ func TestLightningWireProtocol(t *testing.T) {
 				t.Fatalf("unable to generate addresses: %v", err)
 			}
 
+			numExtraBytes := r.Int31n(1000)
+			if numExtraBytes > 0 {
+				req.ExtraOpaqueData = make([]byte, numExtraBytes)
+				_, err := r.Read(req.ExtraOpaqueData[:])
+				if err != nil {
+					t.Fatalf("unable to generate opaque "+
+						"bytes: %v", err)
+					return
+				}
+			}
+
 			v[0] = reflect.ValueOf(req)
 		},
 		MsgChannelUpdate: func(v []reflect.Value, r *rand.Rand) {
 			var err error
+
+			msgFlags := ChanUpdateMsgFlags(r.Int31())
+			maxHtlc := MilliSatoshi(r.Int63())
+
+			// We make the max_htlc field zero if it is not flagged
+			// as being part of the ChannelUpdate, to pass
+			// serialization tests, as it will be ignored if the bit
+			// is not set.
+			if msgFlags&ChanUpdateOptionMaxHtlc == 0 {
+				maxHtlc = 0
+			}
+
 			req := ChannelUpdate{
 				ShortChannelID:  NewShortChanIDFromInt(uint64(r.Int63())),
 				Timestamp:       uint32(r.Int31()),
-				Flags:           ChanUpdateFlag(r.Int31()),
+				MessageFlags:    msgFlags,
+				ChannelFlags:    ChanUpdateChanFlags(r.Int31()),
 				TimeLockDelta:   uint16(r.Int31()),
 				HtlcMinimumMsat: MilliSatoshi(r.Int63()),
+				HtlcMaximumMsat: maxHtlc,
 				BaseFee:         uint32(r.Int31()),
 				FeeRate:         uint32(r.Int31()),
 			}
@@ -596,6 +708,17 @@ func TestLightningWireProtocol(t *testing.T) {
 			if _, err := r.Read(req.ChainHash[:]); err != nil {
 				t.Fatalf("unable to generate chain hash: %v", err)
 				return
+			}
+
+			numExtraBytes := r.Int31n(1000)
+			if numExtraBytes > 0 {
+				req.ExtraOpaqueData = make([]byte, numExtraBytes)
+				_, err := r.Read(req.ExtraOpaqueData[:])
+				if err != nil {
+					t.Fatalf("unable to generate opaque "+
+						"bytes: %v", err)
+					return
+				}
 			}
 
 			v[0] = reflect.ValueOf(req)
@@ -621,6 +744,17 @@ func TestLightningWireProtocol(t *testing.T) {
 			if _, err := r.Read(req.ChannelID[:]); err != nil {
 				t.Fatalf("unable to generate chan id: %v", err)
 				return
+			}
+
+			numExtraBytes := r.Int31n(1000)
+			if numExtraBytes > 0 {
+				req.ExtraOpaqueData = make([]byte, numExtraBytes)
+				_, err := r.Read(req.ExtraOpaqueData[:])
+				if err != nil {
+					t.Fatalf("unable to generate opaque "+
+						"bytes: %v", err)
+					return
+				}
 			}
 
 			v[0] = reflect.ValueOf(req)
@@ -651,9 +785,14 @@ func TestLightningWireProtocol(t *testing.T) {
 			v[0] = reflect.ValueOf(req)
 		},
 		MsgQueryShortChanIDs: func(v []reflect.Value, r *rand.Rand) {
-			req := QueryShortChanIDs{
-				// TODO(roasbeef): later alternate encoding types
-				EncodingType: EncodingSortedPlain,
+			req := QueryShortChanIDs{}
+
+			// With a 50/50 change, we'll either use zlib encoding,
+			// or regular encoding.
+			if r.Int31()%2 == 0 {
+				req.EncodingType = EncodingSortedZlib
+			} else {
+				req.EncodingType = EncodingSortedPlain
 			}
 
 			if _, err := rand.Read(req.ChainHash[:]); err != nil {
@@ -662,12 +801,9 @@ func TestLightningWireProtocol(t *testing.T) {
 			}
 
 			numChanIDs := rand.Int31n(5000)
-
-			req.ShortChanIDs = make([]ShortChannelID, numChanIDs)
 			for i := int32(0); i < numChanIDs; i++ {
-				req.ShortChanIDs[i] = NewShortChanIDFromInt(
-					uint64(r.Int63()),
-				)
+				req.ShortChanIDs = append(req.ShortChanIDs,
+					NewShortChanIDFromInt(uint64(r.Int63())))
 			}
 
 			v[0] = reflect.ValueOf(req)
@@ -687,16 +823,18 @@ func TestLightningWireProtocol(t *testing.T) {
 
 			req.Complete = uint8(r.Int31n(2))
 
-			// TODO(roasbeef): later alternate encoding types
-			req.EncodingType = EncodingSortedPlain
+			// With a 50/50 change, we'll either use zlib encoding,
+			// or regular encoding.
+			if r.Int31()%2 == 0 {
+				req.EncodingType = EncodingSortedZlib
+			} else {
+				req.EncodingType = EncodingSortedPlain
+			}
 
 			numChanIDs := rand.Int31n(5000)
-
-			req.ShortChanIDs = make([]ShortChannelID, numChanIDs)
 			for i := int32(0); i < numChanIDs; i++ {
-				req.ShortChanIDs[i] = NewShortChanIDFromInt(
-					uint64(r.Int63()),
-				)
+				req.ShortChanIDs = append(req.ShortChanIDs,
+					NewShortChanIDFromInt(uint64(r.Int63())))
 			}
 
 			v[0] = reflect.ValueOf(req)
